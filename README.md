@@ -9,7 +9,7 @@ Cet agent Python automatise la récupération des e-mails entrants de la boîte 
 | Ressource | Description |
 | :--- | :--- |
 | **Google Cloud** | APIs **Gmail** et **Sheets** activées. |
-| **Fichiers Locaux** | Clé JSON **`client_secret_...json`**  |
+| **Fichiers Locaux** | Clé JSON   |
 | **Google Sheets ID** |
 
 ##  Structure du Google Sheet
