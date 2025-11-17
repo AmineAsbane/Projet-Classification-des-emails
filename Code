@@ -1,0 +1,236 @@
+import os
+import base64
+import io
+import time
+import re
+import pandas as pd
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+from email.parser import BytesParser
+from email import policy
+
+SPREADSHEET_ID = '1nulWaSYfGQYrCadEYGjj5aKsQMr9qxCvC5o0NY1bpLc' 
+
+CLIENT_SECRET_FILE = 'XX'
+
+SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/spreadsheets'
+]
+
+CATEGORIES_KEYWORDS = {
+    "Problème d’accès / authentification": ['mot de passe', 'connexion', 'identifiant', 's\'authentifier', 'compte bloqué', 'double facteur', 'reset'],
+    "Bug ou dysfonctionnement d’un service": ['bug', 'erreur', 'ne fonctionne pas', 'crash', 'plantage', 'dysfonctionnement', 'affichage incorrect', 'fail'],
+    "Problème technique informatique": ['imprimante', 'vpn', 'serveur', 'réseau', 'disque dur', 'logiciel', 'installation', 'mise à jour', 'ordinateur', 'pc', 'matériel'],
+    "Demande administrative": ['facture', 'congés', 'contrat', 'rh', 'départ', 'remboursement', 'administratif', 'paie'],
+    "Demande de support utilisateur": ['aide', 'formation', 'comment faire', 'question', 'manque information', 'besoin d\'aide']
+}
+
+URGENCY_KEYWORDS = [
+    ('Critique', ['bloqué', 'impossible', 'arrêt de production', 'panne totale', 'ne peut plus travailler']),
+    ('Élevée', ['urgent', 'impact important', 'forte gêne', 'délai critique', 'rapide']),
+    ('Modérée', ['gênant', 'lent', 'à vérifier', 'problème mineur']),
+    ('Faible', ['simple demande', 'quand vous aurez le temps', 'pas pressé']),
+    ('Anodine', ['juste une question', 'information', 'suggestion'])
+]
+
+ALL_CATEGORIES = list(CATEGORIES_KEYWORDS.keys())
+SHEET_COLUMNS = ['sujet', 'urgence', 'synthese']
+
+SHEET_MAPPING = {
+    "Problème d’accès / authentification": "AccesAuth",
+    "Bug ou dysfonctionnement d’un service": "BugDysfct",
+    "Problème technique informatique": "TechInfo",
+    "Demande administrative": "Admin",
+    "Demande de support utilisateur": "SupportUser"
+}
+
+
+def get_google_services():
+    """Initialise et retourne les objets services pour Gmail et Sheets."""
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+            creds = flow.run_local_server(port=0) 
+        
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+
+    service_gmail = build('gmail', 'v1', credentials=creds)
+    service_sheets = build('sheets', 'v4', credentials=creds)
+    print(" Services Google (Gmail et Sheets) initialisés avec succès.")
+    return service_gmail, service_sheets
+
+
+def get_email_content(message):
+    """Décode le contenu MIME d'un message pour extraire le sujet et le corps."""
+    raw_bytes = base64.urlsafe_b64decode(message['raw'])
+    email_file = io.BytesIO(raw_bytes)
+    email_message = BytesParser(policy=policy.default).parse(email_file)
+
+    sujet = email_message['subject'] if email_message['subject'] else 'Pas de sujet'
+    contenu = ""
+    
+    if email_message.is_multipart():
+        for part in email_message.walk():
+            ctype = part.get_content_type()
+            cdisp = part.get('Content-Disposition')
+            if ctype == 'text/plain' and cdisp is None:
+                contenu = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', 'ignore')
+                break 
+    else:
+        contenu = email_message.get_payload(decode=True).decode(email_message.get_content_charset() or 'utf-8', 'ignore')
+
+    return sujet, contenu.strip()
+
+def get_all_tickets(service):
+    """Récupère tous les tickets de la boîte de réception avec pagination."""
+    tickets_data = []
+    page_token = None
+    search_query = 'is:inbox'
+    
+    print("Début de la récupération des IDs des tickets...")
+    
+    while True:
+        try:
+            response = service.users().messages().list(
+                userId='me', q=search_query, pageToken=page_token, maxResults=500 
+            ).execute()
+            
+            messages = response.get('messages', [])
+            if not messages: break
+                
+            print(f"-> Récupération du contenu de {len(messages)} messages de la page courante...")
+
+            for msg in messages:
+                message = service.users().messages().get(userId='me', id=msg['id'], format='raw').execute()
+                sujet, contenu = get_email_content(message)
+                tickets_data.append({'id': msg['id'], 'sujet': sujet, 'contenu': contenu})
+
+            page_token = response.get('nextPageToken')
+            if not page_token: break
+            
+            print(f"Actuellement {len(tickets_data)} tickets récupérés. Pause...")
+            time.sleep(1) 
+
+        except Exception as e:
+            print(f" Erreur critique lors de la récupération : {e}")
+            break
+            
+    print(f"\n Récupération terminée ! Total de {len(tickets_data)} tickets récupérés.")
+    return tickets_data
+
+
+
+def analyze_ticket(sujet, contenu):
+    """Analyse le sujet et le contenu pour déterminer la catégorie, l'urgence, et la synthèse."""
+    text_to_analyze = (sujet + " " + contenu).lower()
+    
+    categorie_trouvee = "Demande de support utilisateur"
+    meilleur_score = 0
+    
+    for categorie, mots_cles in CATEGORIES_KEYWORDS.items():
+        score_actuel = sum(1 for mot in mots_cles if re.search(r'\b' + re.escape(mot) + r'\b', text_to_analyze) for mot in mots_cles if re.search(r'\b' + re.escape(mot) + r'\b', text_to_analyze))
+        
+        if score_actuel > meilleur_score:
+            meilleur_score = score_actuel
+            categorie_trouvee = categorie
+    
+    urgence_attribuee = "Anodine"
+    for niveau, mots_cles in URGENCY_KEYWORDS:
+        if any(re.search(r'\b' + re.escape(mot) + r'\b', text_to_analyze) for mot in mots_cles):
+            urgence_attribuee = niveau
+            break 
+            
+    synthèse = contenu[:100].replace('\n', ' ')
+    if len(contenu) > 100:
+        synthèse += "..."
+
+    return categorie_trouvee, urgence_attribuee, synthèse
+
+
+def update_google_sheet(service, df_enriched, sheet_id):
+    """
+    Écrit les tickets classifiés dans l'onglet correspondant du Google Sheet.
+    Utilise le mapping pour les noms d'onglets simples.
+    """
+    print("\n Début de l'écriture dans Google Sheets...")
+    
+    for categorie in ALL_CATEGORIES:
+        sheet_name_api = SHEET_MAPPING[categorie]
+        
+        df_category = df_enriched[df_enriched['categorie'] == categorie]
+        
+        if df_category.empty:
+            print(f"   -> Pas de tickets pour la catégorie : '{categorie}'. Ignoré.")
+            continue
+            
+        data_to_write = df_category[SHEET_COLUMNS].values.tolist()
+        
+        # Le nom de la feuille simple n'a pas besoin d'être entre guillemets simples
+        range_name = f"{sheet_name_api}!A2" 
+        
+        body = {
+            'values': data_to_write
+        }
+        
+        try:
+            result = service.spreadsheets().values().append(
+                spreadsheetId=sheet_id,
+                range=range_name,
+                valueInputOption='USER_ENTERED',
+                insertDataOption='INSERT_ROWS', 
+                body=body
+            ).execute()
+            
+            appended_rows = result.get('updates', {}).get('updatedRows', 'N/A')
+            print(f"   -> Écrit {appended_rows} lignes dans la feuille '{sheet_name_api}'.")
+            
+        except Exception as e:
+            print(f" Erreur lors de l'écriture dans la feuille '{sheet_name_api}' : {e}")
+            print(f"   ->  ERREUR : Le nom de l'onglet dans Google Sheets DOIT être exactement : '{sheet_name_api}'.")
+
+    print(" Mise à jour du Google Sheet terminée.")
+
+
+
+print(" Démarrage de l'Agent d'automatisation des tickets...")
+
+# 1. Authentification
+service_gmail, service_sheets = get_google_services()
+print("-" * 50)
+
+# 2. Récupération des tickets
+all_tickets = get_all_tickets(service_gmail)
+
+if all_tickets:
+    print("-" * 50)
+    
+    # 3. Analyse et Classification
+    print(" Début de l'analyse et de la classification des tickets...")
+    tickets_enriched = []
+    for ticket in all_tickets:
+        categorie, urgence, synthese = analyze_ticket(ticket['sujet'], ticket['contenu'])
+        ticket['categorie'] = categorie
+        ticket['urgence'] = urgence
+        ticket['synthese'] = synthese
+        tickets_enriched.append(ticket)
+
+    df_tickets = pd.DataFrame(tickets_enriched)
+    print(f" Analyse terminée. {len(df_tickets)} tickets classifiés.")
+    print("-" * 50)
+
+    # 4. Mise à jour du Google Sheet
+    update_google_sheet(service_sheets, df_tickets, SPREADSHEET_ID)
+else:
+    print(" Agent terminé : aucun ticket à traiter.")
